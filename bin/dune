@@ -1,0 +1,7 @@
+(include_subdirs unqualified)
+
+(executable
+ (name main)
+ (public_name dune-distributed-storage)
+ (libraries async cmdliner dune-distributed-storage dune-private-libs.stdune
+   logs-async logs.fmt))

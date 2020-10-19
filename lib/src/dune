@@ -1,5 +1,0 @@
-(executable
- (name main)
- (libraries async cmdliner dune-private-libs.stdune logs-async logs.fmt
-   httpaf httpaf-async uri)
- (public_name dune-cache-distributed-storage))

@@ -1,3 +1,4 @@
+open Dune_distributed_storage
 open Stdune
 
 let path =

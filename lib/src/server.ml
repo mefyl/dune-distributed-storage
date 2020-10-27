@@ -1,4 +1,5 @@
 open Stdune
+module Async_rpc = Async.Rpc.Rpc
 
 let ( >>= ) = Async.( >>= )
 
@@ -57,37 +58,28 @@ let error reqd status =
   in
   Format.ksprintf (error reqd status)
 
-let bad_request = Format.ksprintf (fun reason -> raise (Bad_request reason))
-
 module Blocks = struct
   let check_range ranges address =
     if not (Config.ranges_include ranges address) then
       raise (Misdirected (address, ranges))
 
-  let handle_errors hash path reqd f =
-    Async.try_with ~extract_exn:true f >>= function
-    | Result.Ok v -> Async.return v
-    | Result.Error (Unix.Unix_error (Unix.ENOENT, _, _)) ->
-      error reqd `No_content "block %S not found locally"
-        (Digest.to_string hash)
-    | Result.Error (Unix.Unix_error (Unix.EISDIR, _, _)) ->
+  let handle_error hash path = function
+    | Unix.Unix_error (Unix.EISDIR, _, _) ->
       let* () =
         Logs_async.err (fun m ->
             m "block file is a directory: %S" (Path.to_string path))
       in
-      error reqd `Internal_server_error "unable to read block %S"
-        (Digest.to_string hash)
-    | Result.Error (Unix.Unix_error (Unix.EACCES, _, _)) ->
+      failwith (Fmt.str "unable to read block %S" (Digest.to_string hash))
+    | Unix.Unix_error (Unix.EACCES, _, _) ->
       let* () =
         Logs_async.err (fun m ->
             m "permission denied on block: %S" (Path.to_string path))
       in
-      error reqd `Internal_server_error "unable to read block %S"
-        (Digest.to_string hash)
-    | Result.Error exn ->
+      failwith (Fmt.str "unable to read block %S" (Digest.to_string hash))
+    | exn ->
       let exn = Base.Exn.to_string exn in
       let* () = Logs_async.err (fun m -> m "unexpected exception: %s" exn) in
-      error reqd `Internal_server_error "unexpected exception: %s" exn
+      failwith (Fmt.str "unexpected exception: %s" exn)
 
   let file_path ?path root hash =
     let+ root =
@@ -108,83 +100,29 @@ module Blocks = struct
     in
     Path.relative root (Digest.to_string hash)
 
-  let read ?path { root; ranges } reqd hash f =
+  let head t hash =
+    let* path = file_path t.root hash in
+    Async.return @@ Path.exists path
+
+  let get ?path ~f { ranges; root } hash =
+    let f path stats executable =
+      let* () =
+        let file_size = stats.Core.Unix.Native_file.st_size in
+        Logs_async.info (fun m -> m "> artifact [%i bytes]" file_size)
+      in
+      Async.return @@ (f @@ Path.to_string path, executable)
+    in
     let () = check_range ranges hash in
     let* path = file_path ?path root hash in
     let read () =
       let stats = Path.stat path in
-      let headers =
-        [ ( "X-executable"
-          , if stats.st_perm land 0o100 <> 0 then
-              "1"
-            else
-              "0" )
-        ; ("X-dune-hash", Digest.to_string hash)
-        ]
-      in
-      f path stats headers
+      let executable = stats.st_perm land 0o100 <> 0 in
+      f path stats executable
     in
-    handle_errors hash path reqd read
-
-  let head t reqd hash =
-    let f _ _ headers =
-      let response =
-        let headers =
-          Httpaf.Headers.of_list @@ (("Content-length", "0") :: headers)
-        in
-        Httpaf.Response.create ~headers `OK
-      in
-      let* () = Logs_async.info (fun m -> m "> %s" (status_to_string `OK)) in
-      Async.return @@ Httpaf.Reqd.respond_with_string reqd response ""
-    in
-    read t reqd hash f
-
-  let get ?path t reqd hash =
-    let f path stats headers =
-      let f stats input =
-        let input = Async.Reader.of_in_channel input Async.Fd.Kind.File
-        and file_size = stats.Core.Unix.Native_file.st_size in
-        let response =
-          let headers =
-            Httpaf.Headers.of_list
-            @@ ("Content-length", string_of_int file_size)
-               :: ("Content-type", "application/octet-stream")
-               :: headers
-          in
-          Httpaf.Response.create ~headers `OK
-        in
-        let body = Httpaf.Reqd.respond_with_streaming reqd response in
-        let size = 16 * 1024 in
-        let buffer = Bytes.make size '\x00'
-        and bigstring = Bigstringaf.create size in
-        let rec loop () =
-          Async.Reader.read input buffer >>= function
-          | `Eof -> Async.return ()
-          | `Ok read ->
-            let () =
-              Bigstringaf.unsafe_blit_from_bytes buffer ~src_off:0 bigstring
-                ~dst_off:0 ~len:read
-            in
-            let* () =
-              let () =
-                Httpaf.Body.schedule_bigstring body
-                  (Bigstringaf.sub bigstring ~off:0 ~len:read)
-              and wakeup = Async.Ivar.create () in
-              let () = Httpaf.Body.flush body (Async.Ivar.fill wakeup) in
-              Async.Ivar.read wakeup
-            in
-            loop ()
-        in
-        let* () = loop () in
-        let* () =
-          Logs_async.info (fun m ->
-              m "> %s [%i bytes]" (status_to_string `OK) file_size)
-        in
-        Async.return @@ Httpaf.Body.close_writer body
-      in
-      Core.In_channel.with_file ~binary:true (Path.to_string path) ~f:(f stats)
-    in
-    read ?path t reqd hash f
+    Async.try_with ~extract_exn:true read >>= function
+    | Result.Ok v -> Async.return (Some v)
+    | Result.Error (Unix.Unix_error (Unix.ENOENT, _, _)) -> Async.return None
+    | Result.Error e -> handle_error hash path e
 
   type disk_buffer =
     { buffer : Bytes.t
@@ -192,162 +130,27 @@ module Blocks = struct
     ; size : int
     }
 
-  let put ?path { root; ranges } reqd hash executable =
+  let put ?path ~f { root; ranges } hash executable data =
     let () = check_range ranges hash in
     let* path = file_path ?path root hash in
     let put () =
-      let f output =
-        let write b =
-          if b.pos = 0 then
-            Async.return b
-          else
-            let rec loop from =
-              if from = b.pos then
-                Async.return { b with pos = 0 }
-              else
-                let* written =
-                  let len = b.pos - from in
-                  let () =
-                    Async.Writer.write_bytes output ~pos:from ~len b.buffer
-                  in
-                  let+ () = Async.Writer.flushed output in
-                  len
-                in
-                loop (from + written)
-            in
-            loop 0
-        in
-        let wait = Async.Ivar.create () in
-        let request_body = Httpaf.Reqd.request_body reqd in
-        let rec on_read b bs ~off ~len =
-          let rec blit b blit_from blit_end =
-            if blit_from = blit_end then
-              Async.return
-              @@ Httpaf.Body.schedule_read request_body ~on_eof:(on_eof b)
-                   ~on_read:(on_read b)
-            else
-              let len = min (blit_end - blit_from) (b.size - b.pos) in
-              let () =
-                Bigstringaf.unsafe_blit_to_bytes bs ~src_off:blit_from b.buffer
-                  ~dst_off:b.pos ~len
-              in
-              let b = { b with pos = b.pos + len }
-              and blit_from = blit_from + len in
-              if b.pos = b.size then
-                let* b = write b in
-                blit b blit_from blit_end
-              else
-                blit b blit_from blit_end
-          in
-          Async.don't_wait_for (blit b off (off + len))
-        and on_eof b () =
-          let finalize =
-            let* _ = write b in
-            let* () =
-              Logs_async.info (fun m -> m "> %s" (status_to_string `Created))
-            in
-            let* () = response reqd `Created in
-            Async.return @@ Async.Ivar.fill wait ()
-          in
-          Async.don't_wait_for finalize
-        in
-        let () =
-          let size = 16 * 1024 * 1024 in
-          let buffer = { buffer = Bytes.make size '\x00'; pos = 0; size } in
-          Httpaf.Body.schedule_read request_body ~on_eof:(on_eof buffer)
-            ~on_read:(on_read buffer)
-        in
-        Async.Ivar.read wait
-      in
       let perm =
         if executable then
           0o700
         else
           0o600
-      in
-      Async.Writer.with_file ~perm ~f (Path.to_string path)
+      and f c = f c data in
+      Async.return @@ Core.Out_channel.with_file ~perm (Path.to_string path) ~f
     in
-    handle_errors hash path reqd put
+    Async.try_with ~extract_exn:true put >>= function
+    | Result.Ok v -> Async.return v
+    | Result.Error e -> handle_error hash path e
 end
 
 let string_of_sockaddr = function
   | `Unix p -> p
   | `Inet (addr, port) ->
     Format.sprintf "%s:%i" (Unix.Inet_addr.to_string addr) port
-
-let request_handler t sockaddr reqd =
-  let { Httpaf.Request.meth; target; headers; _ } = Httpaf.Reqd.request reqd in
-  let name =
-    Fmt.str "%s: %s %s"
-      (string_of_sockaddr sockaddr)
-      (Httpaf.Method.to_string meth)
-      target
-  in
-  let respond =
-    let f () =
-      let* () = Logs_async.info (fun m -> m "%s" name) in
-      let meth =
-        match meth with
-        | `HEAD -> `HEAD
-        | `GET -> `GET
-        | `PUT -> `PUT
-        | _ -> raise (Method_not_allowed meth)
-      in
-      match String.split ~on:'/' target with
-      | [ ""; "blocks"; hash ] -> (
-        let hash =
-          match Digest.from_hex hash with
-          | Some hash -> hash
-          | None -> bad_request "invalid hash: %S" hash
-        in
-        match meth with
-        | `HEAD -> Blocks.head t reqd hash
-        | `GET -> Blocks.get t reqd hash
-        | `PUT ->
-          let executable =
-            Httpaf.Headers.get headers "X-executable" = Some "1"
-          in
-          Blocks.put t reqd hash executable )
-      | [ ""; "index"; path; hash ] -> (
-        match Digest.from_hex hash with
-        | None -> error reqd `Bad_request "invalid hash: %S" hash
-        | Some hash -> (
-          match meth with
-          | `HEAD -> raise (Method_not_allowed meth)
-          | `GET -> Blocks.get ~path t reqd hash
-          | `PUT -> Blocks.put ~path t reqd hash false ) )
-      | path ->
-        error reqd `Bad_request "no such endpoint: %S"
-          (String.concat ~sep:"/" path)
-    in
-    try
-      Async.try_with ~name ~extract_exn:true f >>= function
-      | Result.Ok () -> Async.return ()
-      | Result.Error (Bad_request reason) -> error reqd `Bad_request "%s" reason
-      | Result.Error (Method_not_allowed _) ->
-        error reqd `Method_not_allowed "method not allowed"
-      | Result.Error (Misdirected (addr, _)) ->
-        error reqd (`Code 421) "address %s not in range" (Digest.to_string addr)
-      | Result.Error exn ->
-        error reqd `Internal_server_error "unexpected exception: %s"
-          (Core.Exn.to_string exn)
-    with e ->
-      Caml.print_endline "FUCK";
-      raise e
-  in
-
-  Async.don't_wait_for respond
-
-let error_handler _ ?request:_ error start_response =
-  let response_body = start_response Httpaf.Headers.empty in
-  ( match error with
-  | `Exn exn ->
-    Httpaf.Body.write_string response_body (Printexc.to_string exn);
-    Httpaf.Body.write_string response_body "\n"
-  | #Httpaf.Status.standard as error ->
-    Httpaf.Body.write_string response_body
-      (Httpaf.Status.default_reason_phrase error) );
-  Httpaf.Body.close_writer response_body
 
 let trim { root; ranges } ~goal =
   let files =
@@ -456,18 +259,65 @@ let run config host port root trim_period trim_size =
         ()
       | Result.Error exn -> raise exn
     in
-    let t = { root; ranges } in
-    let request_handler = request_handler t in
-    let handler =
-      Httpaf_async.Server.create_connection_handler ~request_handler
-        ~error_handler
+    let implementations =
+      let hash h =
+        match Digest.from_hex h with
+        | None -> failwith "invalid hash"
+        | Some h -> h
+      in
+      let block_get =
+        let f t h = Blocks.get ~f:Core.In_channel.read_all t (hash h) in
+        Async_rpc.implement Rpc.block_get f
+      and block_has =
+        let f t h = Blocks.head t (hash h) in
+        Async_rpc.implement Rpc.block_has f
+      and block_put =
+        let f t (h, executable, contents) =
+          Blocks.put ~f:Core.Out_channel.output_string t (hash h) executable
+            contents
+        in
+        Async_rpc.implement Rpc.block_put f
+      and index_get =
+        let f t (path, h) =
+          Blocks.get ~path ~f:Core.In_channel.read_lines t (hash h) >>| function
+          | Some (v, _) -> Some v
+          | None -> None
+        in
+        Async_rpc.implement Rpc.index_get f
+      and index_put =
+        let f t (path, h, contents) =
+          Blocks.put ~f:Core.Out_channel.output_lines ~path t (hash h) false
+            contents
+        in
+        Async_rpc.implement Rpc.index_put f
+      in
+      match
+        Async.Rpc.Implementations.create
+          ~implementations:
+            [ block_get; block_has; block_put; index_get; index_put ]
+          ~on_unknown_rpc:`Raise
+      with
+      | Result.Ok impls -> impls
+      | Result.Error (`Duplicate_implementations _) -> failwith "duplicate RPC"
     in
+    let t = { root; ranges } in
     let* server =
-      Async.Tcp.Server.create_sock ~on_handler_error:`Raise
+      Async.Tcp.Server.create
+        ~on_handler_error:
+          (`Call
+            (fun _ exn -> Async.Log.Global.sexp [%sexp (exn : Base.Exn.t)]))
         (Async.Tcp.Where_to_listen.bind_to
            (Async.Tcp.Bind_to_address.Address host)
            (Async.Tcp.Bind_to_port.On_port port))
-        handler
+        (fun _addr r w ->
+          Async.Rpc.Connection.server_with_close r w
+            ~connection_state:(fun _ -> t)
+            ~on_handshake_error:
+              (`Call
+                (fun exn ->
+                  Async.Log.Global.sexp [%sexp (exn : Base.Exn.t)];
+                  Async.return ()))
+            ~implementations)
     in
     let stop = Async.Tcp.Server.close_finished server in
     let () =
@@ -480,16 +330,3 @@ let run config host port root trim_period trim_size =
     stop
   in
   Async.Thread_safe.block_on_async main
-
-(* try%lwt
- *   let* _server =
- *     Lwt_io.establish_server_with_client_socket listen_address handler
- *   in
- *   let rec loop () =
- *     let* () = Lwt_unix.sleep trim_period in
- *     let* () = trim t ~goal:trim_size in
- *     loop ()
- *   in
- *   loop ()
- * with Unix.Unix_error (Unix.EACCES, "bind", _) ->
- *   Logs_async.err (fun m -> m "unable to bind to port %i" port) *)

@@ -3,5 +3,7 @@
 (library
  (name dune_distributed_storage)
  (public_name dune-distributed-storage)
- (libraries async dune-private-libs.stdune logs-async logs.fmt httpaf
-   httpaf-async uri))
+ (libraries async async_rpc_kernel dune-private-libs.stdune logs-async
+   logs.fmt httpaf httpaf-async uri)
+ (preprocess
+  (pps ppx_jane)))

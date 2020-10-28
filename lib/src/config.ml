@@ -4,7 +4,7 @@ module Sexp = Sexplib.Sexp
 type t = { nodes : node list }
 
 and node =
-  { hostname : Uri.t
+  { hostname : string
   ; space : range list
   }
 
@@ -21,7 +21,7 @@ let node_of_sexp = function
     let f (hostname, ranges) = function
       | Sexp.List [ Sexp.Atom "hostname"; Sexp.Atom h ] -> (
         match hostname with
-        | None -> Result.return (Some (Uri.of_string h), ranges)
+        | None -> Result.return (Some h, ranges)
         | Some _ -> Result.Error ("duplicate hostname statement: " ^ h) )
       | Sexp.List [ Sexp.Atom "range"; Sexp.Atom start; Sexp.Atom end_ ] -> (
         let* start = parse_address start '0' in

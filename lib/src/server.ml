@@ -231,19 +231,16 @@ let run config host port root trim_period trim_size =
     | Some path -> (
       match Config.of_file path with
       | Result.Ok c -> (
-        let self = Uri.make ~host:(Unix.gethostname ()) ~port () in
+        let self = Format.sprintf "%s:%d" (Unix.gethostname ()) port in
         let f { Config.hostname; _ } =
           (* FIXME: also lookup ourselves by IP *)
-          let hostname = Uri.with_scheme hostname None in
-          Uri.equal hostname self
+          String.equal hostname self
         in
         match List.find ~f c.nodes with
         | Some { space; _ } -> space
         | None ->
           User_error.raise
-            [ Pp.textf "unable to find self (%s) in configuration file"
-                (Uri.to_string self)
-            ] )
+            [ Pp.textf "unable to find self (%s) in configuration file" self ] )
       | Result.Error e ->
         User_error.raise
           [ Pp.textf "configuration error in %s: %s" (Path.to_string path) e ] )

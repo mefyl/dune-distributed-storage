@@ -223,19 +223,29 @@ let run config host port root trim_period trim_size =
         | Some h -> h
       in
       let block_get =
-        let f t h = Blocks.get ~f:Core.In_channel.read_all t (hash h) in
+        let f t h =
+          let* () = Logs_async.info (fun m -> m "GET blocks/%s" h) in
+          Blocks.get ~f:Core.In_channel.read_all t (hash h)
+        in
         Async_rpc.implement Rpc.block_get f
       and block_has =
-        let f t h = Blocks.head t (hash h) in
+        let f t h =
+          let* () = Logs_async.info (fun m -> m "HEAD blocks/%s" h) in
+
+          Blocks.head t (hash h)
+        in
         Async_rpc.implement Rpc.block_has f
       and block_put =
         let f t (h, executable, contents) =
+          let* () = Logs_async.info (fun m -> m "PUT blocks/%s" h) in
+
           Blocks.put ~f:Core.Out_channel.output_string t (hash h) executable
             contents
         in
         Async_rpc.implement Rpc.block_put f
       and index_get =
         let f t (path, h) =
+          let* () = Logs_async.info (fun m -> m "GET index/%s" h) in
           Blocks.get ~path ~f:Core.In_channel.read_lines t (hash h) >>| function
           | Some (v, _) -> Some v
           | None -> None
@@ -243,6 +253,7 @@ let run config host port root trim_period trim_size =
         Async_rpc.implement Rpc.index_get f
       and index_put =
         let f t (path, h, contents) =
+          let* () = Logs_async.info (fun m -> m "PUT index/%s" h) in
           Blocks.put ~f:Core.Out_channel.output_lines ~path t (hash h) false
             contents
         in

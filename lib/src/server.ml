@@ -17,51 +17,11 @@ type t =
   ; ranges : Config.range list
   }
 
-exception Misdirected of Digest.t * Config.range list
-
-exception Bad_request of string
-
-exception Method_not_allowed of Httpaf.Method.t
-
-let status_to_string = function
-  | `Code i -> Format.sprintf "%i" i
-  | #Httpaf.Status.standard as status ->
-    Format.sprintf "%s %s"
-      (Httpaf.Status.to_string status)
-      (Httpaf.Status.default_reason_phrase status)
-
-let response reqd status =
-  let headers = Httpaf.Headers.of_list [ ("Content-length", "0") ] in
-  let response = Httpaf.Response.create ~headers status in
-  Async.return @@ Httpaf.Reqd.respond_with_string reqd response ""
-
-let error reqd status =
-  let error reqd status reason =
-    let* () =
-      Logs_async.info (fun m -> m "> %s: %s" (status_to_string status) reason)
-    in
-    if status = `No_content then
-      let response =
-        Httpaf.Response.create ~headers:Httpaf.Headers.empty status
-      in
-      Async.return @@ Httpaf.Reqd.respond_with_string reqd response ""
-    else
-      let contents = Format.sprintf "{\"reason\": %S}" reason in
-      let headers =
-        Httpaf.Headers.of_list
-          [ ("Content-type", "application/json")
-          ; ("Content-length", Int.to_string (String.length contents))
-          ]
-      in
-      let response = Httpaf.Response.create ~headers status in
-      Async.return @@ Httpaf.Reqd.respond_with_string reqd response contents
-  in
-  Format.ksprintf (error reqd status)
-
 module Blocks = struct
   let check_range ranges address =
     if not (Config.ranges_include ranges address) then
-      raise (Misdirected (address, ranges))
+      User_error.raise
+        [ Pp.textf "not handling address %s" (Digest.to_string address) ]
 
   let handle_error hash path = function
     | Unix.Unix_error (Unix.EISDIR, _, _) ->

@@ -265,24 +265,27 @@ let run config host port root trim_period trim_size =
         in
         Async_rpc.implement Rpc.index_put f
       and metadata_put =
-        let f { t; connection } (h, contents) =
+        let f { t; connection } (h, payload) =
           let* () = Logs_async.info (fun m -> m "PUT metadata/%s" h) in
-          match Cache.Local.Metadata_file.of_string contents with
-          | Result.Ok { files; _ } ->
+          match Cache.Local.Metadata_file.of_string payload with
+          | Result.Ok { contents; _ } ->
             let+ () =
               Blocks.put ~f:Core.Out_channel.output_string t (hash h) false
-                contents
+                payload
             and+ () =
-              let f { Cache.File.digest; _ } =
-                Async_rpc.dispatch_exn Rpc.block_get connection
-                  (Digest.to_string digest)
-                >>= function
-                | Some (contents, executable) ->
-                  Blocks.put ~f:Core.Out_channel.output_string t (hash h)
-                    executable contents
-                | None -> Async.return ()
-              in
-              Async.Deferred.List.iter ~f files
+              match contents with
+              | Files files ->
+                let f { Cache.File.digest; _ } =
+                  Async_rpc.dispatch_exn Rpc.block_get connection
+                    (Digest.to_string digest)
+                  >>= function
+                  | Some (contents, executable) ->
+                    Blocks.put ~f:Core.Out_channel.output_string t (hash h)
+                      executable contents
+                  | None -> Async.return ()
+                in
+                Async.Deferred.List.iter ~f files
+              | Value _ -> Async.return ()
             in
             ()
           | Result.Error e -> failwith e

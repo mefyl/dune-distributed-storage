@@ -9,3 +9,5 @@ val block_put : (string * bool * string, unit) Rpc.t
 val index_get : (string * string, string list option) Rpc.t
 
 val index_put : (string * string * string list, unit) Rpc.t
+
+val metadata_put : (string * string, unit) Rpc.t

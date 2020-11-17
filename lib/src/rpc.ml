@@ -24,3 +24,8 @@ let index_put =
   let bin_query = [%bin_type_class: string * string * string list]
   and bin_response = [%bin_type_class: unit] in
   Async.Rpc.Rpc.create ~name:"put_index" ~version:0 ~bin_query ~bin_response
+
+let metadata_put =
+  let bin_query = [%bin_type_class: string * string]
+  and bin_response = [%bin_type_class: unit] in
+  Async.Rpc.Rpc.create ~name:"put_metadata" ~version:0 ~bin_query ~bin_response

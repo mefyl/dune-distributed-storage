@@ -9,12 +9,19 @@ let ( let* ) = ( >>= )
 
 let ( let+ ) = ( >>| )
 
+let ( and+ ) = Async.Deferred.both
+
 module Unix_caml = Unix
 module Unix = Async.Unix
 
 type t =
   { root : Path.t
   ; ranges : Config.range list
+  }
+
+type state =
+  { connection : Async.Rpc.Connection.t
+  ; t : t
   }
 
 module Blocks = struct
@@ -223,28 +230,27 @@ let run config host port root trim_period trim_size =
         | Some h -> h
       in
       let block_get =
-        let f t h =
+        let f { t; _ } h =
           let* () = Logs_async.info (fun m -> m "GET blocks/%s" h) in
           Blocks.get ~f:Core.In_channel.read_all t (hash h)
         in
         Async_rpc.implement Rpc.block_get f
       and block_has =
-        let f t h =
+        let f { t; _ } h =
           let* () = Logs_async.info (fun m -> m "HEAD blocks/%s" h) in
 
           Blocks.head t (hash h)
         in
         Async_rpc.implement Rpc.block_has f
       and block_put =
-        let f t (h, executable, contents) =
+        let f { t; _ } (h, executable, contents) =
           let* () = Logs_async.info (fun m -> m "PUT blocks/%s" h) in
-
           Blocks.put ~f:Core.Out_channel.output_string t (hash h) executable
             contents
         in
         Async_rpc.implement Rpc.block_put f
       and index_get =
-        let f t (path, h) =
+        let f { t; _ } (path, h) =
           let* () = Logs_async.info (fun m -> m "GET index/%s" h) in
           Blocks.get ~path ~f:Core.In_channel.read_lines t (hash h) >>| function
           | Some (v, _) -> Some v
@@ -252,17 +258,47 @@ let run config host port root trim_period trim_size =
         in
         Async_rpc.implement Rpc.index_get f
       and index_put =
-        let f t (path, h, contents) =
+        let f { t; _ } (path, h, contents) =
           let* () = Logs_async.info (fun m -> m "PUT index/%s" h) in
           Blocks.put ~f:Core.Out_channel.output_lines ~path t (hash h) false
             contents
         in
         Async_rpc.implement Rpc.index_put f
+      and metadata_put =
+        let f { t; connection } (h, contents) =
+          let* () = Logs_async.info (fun m -> m "PUT metadata/%s" h) in
+          match Cache.Local.Metadata_file.of_string contents with
+          | Result.Ok { files; _ } ->
+            let+ () =
+              Blocks.put ~f:Core.Out_channel.output_string t (hash h) false
+                contents
+            and+ () =
+              let f { Cache.File.digest; _ } =
+                Async_rpc.dispatch_exn Rpc.block_get connection
+                  (Digest.to_string digest)
+                >>= function
+                | Some (contents, executable) ->
+                  Blocks.put ~f:Core.Out_channel.output_string t (hash h)
+                    executable contents
+                | None -> Async.return ()
+              in
+              Async.Deferred.List.iter ~f files
+            in
+            ()
+          | Result.Error e -> failwith e
+        in
+        Async_rpc.implement Rpc.metadata_put f
       in
       match
         Async.Rpc.Implementations.create
           ~implementations:
-            [ block_get; block_has; block_put; index_get; index_put ]
+            [ block_get
+            ; block_has
+            ; block_put
+            ; index_get
+            ; index_put
+            ; metadata_put
+            ]
           ~on_unknown_rpc:`Raise
       with
       | Result.Ok impls -> impls
@@ -279,7 +315,7 @@ let run config host port root trim_period trim_size =
            (Async.Tcp.Bind_to_port.On_port port))
         (fun _addr r w ->
           Async.Rpc.Connection.server_with_close r w
-            ~connection_state:(fun _ -> t)
+            ~connection_state:(fun connection -> { connection; t })
             ~on_handshake_error:
               (`Call
                 (fun exn ->

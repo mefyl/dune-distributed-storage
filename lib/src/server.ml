@@ -267,22 +267,29 @@ let run config host port root trim_period trim_size =
       and metadata_put =
         let f { t; connection } (h, payload) =
           let* () = Logs_async.info (fun m -> m "PUT metadata/%s" h) in
+          let h = hash h in
           match Cache.Local.Metadata_file.of_string payload with
           | Result.Ok { contents; _ } ->
             let+ () =
-              Blocks.put ~f:Core.Out_channel.output_string t (hash h) false
-                payload
+              if Config.ranges_include ranges h then
+                Blocks.put ~f:Core.Out_channel.output_string t h false payload
+              else
+                Async.Deferred.return ()
             and+ () =
               match contents with
               | Files files ->
                 let f { Cache.File.digest; _ } =
-                  let h = Digest.to_string digest in
-                  let* () = Logs_async.info (fun m -> m "FETCH %s" h) in
-                  Async_rpc.dispatch_exn Rpc.block_get connection h >>= function
-                  | Some (contents, executable) ->
-                    Blocks.put ~f:Core.Out_channel.output_string t (hash h)
-                      executable contents
-                  | None -> Async.return ()
+                  if Config.ranges_include ranges digest then
+                    let h = Digest.to_string digest in
+                    let* () = Logs_async.info (fun m -> m "FETCH %s" h) in
+                    Async_rpc.dispatch_exn Rpc.block_get connection h
+                    >>= function
+                    | Some (contents, executable) ->
+                      Blocks.put ~f:Core.Out_channel.output_string t (hash h)
+                        executable contents
+                    | None -> Async.return ()
+                  else
+                    Async.Deferred.return ()
                 in
                 Async.Deferred.List.iter ~f files
               | Value _ -> Async.return ()

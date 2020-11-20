@@ -276,9 +276,9 @@ let run config host port root trim_period trim_size =
               match contents with
               | Files files ->
                 let f { Cache.File.digest; _ } =
-                  Async_rpc.dispatch_exn Rpc.block_get connection
-                    (Digest.to_string digest)
-                  >>= function
+                  let h = Digest.to_string digest in
+                  let* () = Logs_async.info (fun m -> m "FETCH %s" h) in
+                  Async_rpc.dispatch_exn Rpc.block_get connection h >>= function
                   | Some (contents, executable) ->
                     Blocks.put ~f:Core.Out_channel.output_string t (hash h)
                       executable contents

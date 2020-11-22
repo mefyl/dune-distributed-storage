@@ -29,8 +29,6 @@
   fmt
   logs
   logs-async
-  httpaf
-  httpaf-async
   (ocamlformat
    (and
     (= 0.15.0)

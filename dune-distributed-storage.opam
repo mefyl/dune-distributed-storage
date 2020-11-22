@@ -16,8 +16,6 @@ depends: [
   "fmt"
   "logs"
   "logs-async"
-  "httpaf"
-  "httpaf-async"
   "ocamlformat" {= "0.15.0" & dev}
   "uri"
 ]

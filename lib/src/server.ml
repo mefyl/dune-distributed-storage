@@ -31,13 +31,13 @@ module Blocks = struct
         [ Pp.textf "not handling address %s" (Digest.to_string address) ]
 
   let handle_error hash path = function
-    | Unix.Unix_error (Unix.EISDIR, _, _) ->
+    | Unix.Unix_error (Unix.Error.EISDIR, _, _) ->
       let* () =
         Logs_async.err (fun m ->
             m "block file is a directory: %S" (Path.to_string path))
       in
       failwith (Fmt.str "unable to read block %S" (Digest.to_string hash))
-    | Unix.Unix_error (Unix.EACCES, _, _) ->
+    | Unix.Unix_error (Unix.Error.EACCES, _, _) ->
       let* () =
         Logs_async.err (fun m ->
             m "permission denied on block: %S" (Path.to_string path))
@@ -58,7 +58,7 @@ module Blocks = struct
               Unix.mkdir ~p:() ~perm:0o700 (Path.to_string path))
           >>| function
           | Result.Ok ()
-          | Result.Error (Unix.Unix_error (Unix.EEXIST, _, _)) ->
+          | Result.Error (Unix.Unix_error (Unix.Error.EEXIST, _, _)) ->
             ()
           | Result.Error exn -> raise exn
         in
@@ -88,7 +88,8 @@ module Blocks = struct
     in
     Async.try_with ~extract_exn:true read >>= function
     | Result.Ok v -> Async.return (Some v)
-    | Result.Error (Unix.Unix_error (Unix.ENOENT, _, _)) -> Async.return None
+    | Result.Error (Unix.Unix_error (Unix.Error.ENOENT, _, _)) ->
+      Async.return None
     | Result.Error e -> handle_error hash path e
 
   type disk_buffer =
@@ -219,7 +220,7 @@ let run config host port root trim_period trim_size =
         Unix.mkdir ~p:() ~perm:0o700 (Path.to_string root) )
       >>| function
       | Result.Ok ()
-      | Result.Error (Unix.Unix_error (Unix.EEXIST, _, _)) ->
+      | Result.Error (Unix.Unix_error (Unix.Error.EEXIST, _, _)) ->
         ()
       | Result.Error exn -> raise exn
     in

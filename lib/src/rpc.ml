@@ -2,8 +2,10 @@ open Core
 
 let block_get =
   let bin_query = [%bin_type_class: string]
-  and bin_response = [%bin_type_class: (string * bool) option] in
-  Async.Rpc.Rpc.create ~name:"get_block" ~version:0 ~bin_query ~bin_response
+  and bin_response = [%bin_type_class: (string, bool) Either.t]
+  and bin_error = [%bin_type_class: unit] in
+  Async.Rpc.Pipe_rpc.create ~name:"get_block" ~version:0 ~bin_query
+    ~bin_response ~bin_error ()
 
 let block_has =
   let bin_query = [%bin_type_class: string]

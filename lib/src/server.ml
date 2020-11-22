@@ -97,7 +97,7 @@ module Blocks = struct
     ; size : int
     }
 
-  let put ?path ~f { root; ranges } hash executable data =
+  let put ?path ~f { root; ranges } hash executable =
     let () = check_range ranges hash in
     let* path = file_path ?path root hash in
     let put () =
@@ -106,8 +106,8 @@ module Blocks = struct
           0o700
         else
           0o600
-      and f c = f c data in
-      Async.return @@ Core.Out_channel.with_file ~perm (Path.to_string path) ~f
+      in
+      Core.Out_channel.with_file ~perm (Path.to_string path) ~f
     in
     Async.try_with ~extract_exn:true put >>= function
     | Result.Ok v -> Async.return v
@@ -232,9 +232,24 @@ let run config host port root trim_period trim_size =
       let block_get =
         let f { t; _ } h =
           let* () = Logs_async.info (fun m -> m "GET blocks/%s" h) in
-          Blocks.get ~f:Core.In_channel.read_all t (hash h)
+          let block =
+            let f path =
+              let* reader = Async.Reader.open_file path in
+              Async.return @@ Async.Reader.pipe reader
+            in
+            Blocks.get ~f t (hash h)
+          in
+          block >>= function
+          | None -> Async.return @@ Result.Error ()
+          | Some (contents, executable) ->
+            let+ contents = contents in
+            Result.return
+            @@ Async.Pipe.concat
+                 [ Async.Pipe.of_list [ Core.Either.second executable ]
+                 ; Async.Pipe.map ~f:Core.Either.first contents
+                 ]
         in
-        Async_rpc.implement Rpc.block_get f
+        Async.Rpc.Pipe_rpc.implement Rpc.block_get f
       and block_has =
         let f { t; _ } h =
           let* () = Logs_async.info (fun m -> m "HEAD blocks/%s" h) in
@@ -245,8 +260,8 @@ let run config host port root trim_period trim_size =
       and block_put =
         let f { t; _ } (h, executable, contents) =
           let* () = Logs_async.info (fun m -> m "PUT blocks/%s" h) in
-          Blocks.put ~f:Core.Out_channel.output_string t (hash h) executable
-            contents
+          let f c = Async.return @@ Core.Out_channel.output_string c contents in
+          Blocks.put ~f t (hash h) executable
         in
         Async_rpc.implement Rpc.block_put f
       and index_get =
@@ -260,8 +275,8 @@ let run config host port root trim_period trim_size =
       and index_put =
         let f { t; _ } (path, h, contents) =
           let* () = Logs_async.info (fun m -> m "PUT index/%s" h) in
-          Blocks.put ~f:Core.Out_channel.output_lines ~path t (hash h) false
-            contents
+          let f c = Async.return @@ Core.Out_channel.output_lines c contents in
+          Blocks.put ~f ~path t (hash h) false
         in
         Async_rpc.implement Rpc.index_put f
       and metadata_put =
@@ -272,7 +287,10 @@ let run config host port root trim_period trim_size =
           | Result.Ok { contents; _ } ->
             let+ () =
               if Config.ranges_include ranges h then
-                Blocks.put ~f:Core.Out_channel.output_string t h false payload
+                let f c =
+                  Async.return @@ Core.Out_channel.output_string c payload
+                in
+                Blocks.put ~f t h false
               else
                 Async.Deferred.return ()
             and+ () =
@@ -282,12 +300,34 @@ let run config host port root trim_period trim_size =
                   if Config.ranges_include ranges digest then
                     let h = Digest.to_string digest in
                     let* () = Logs_async.info (fun m -> m "FETCH %s" h) in
-                    Async_rpc.dispatch_exn Rpc.block_get connection h
+                    Async.Rpc.Pipe_rpc.dispatch Rpc.block_get connection h
                     >>= function
-                    | Some (contents, executable) ->
-                      Blocks.put ~f:Core.Out_channel.output_string t (hash h)
-                        executable contents
-                    | None -> Async.return ()
+                    | Result.Ok (Result.Ok (pipe, _)) -> (
+                      Async.Pipe.read pipe >>= function
+                      | `Eof
+                      | `Ok (Core.Either.First _) ->
+                        let* () =
+                          Logs_async.err (fun m ->
+                              m "missing executable metadata in block_put %s" h)
+                        in
+                        Async.return ()
+                      | `Ok (Core.Either.Second executable) ->
+                        let f c =
+                          let writer =
+                            Async.Writer.of_out_channel c Unix.Fd.Kind.File
+                            |> Async.Writer.pipe
+                          in
+                          let f = function
+                            | Core.Either.First s -> s
+                            | Core.Either.Second _ ->
+                              (* Fail more gracefully *)
+                              failwith
+                                "metadata in the middle of put_block data"
+                          in
+                          Async.Pipe.transfer ~f pipe writer
+                        in
+                        Blocks.put ~f t (hash h) executable )
+                    | _ -> Async.return ()
                   else
                     Async.Deferred.return ()
                 in

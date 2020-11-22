@@ -1,6 +1,7 @@
+open Base
 open Async.Rpc
 
-val block_get : (string, (string * bool) option) Rpc.t
+val block_get : (string, (string, bool) Either.t, unit) Pipe_rpc.t
 
 val block_has : (string, bool) Rpc.t
 

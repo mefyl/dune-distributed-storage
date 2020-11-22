@@ -108,7 +108,7 @@ module Blocks = struct
         else
           0o600
       in
-      Core.Out_channel.with_file ~perm (Path.to_string path) ~f
+      Async.Writer.with_file_atomic ~perm (Path.to_string path) ~f
     in
     Async.try_with ~extract_exn:true put >>= function
     | Result.Ok v -> Async.return v
@@ -261,7 +261,7 @@ let run config host port root trim_period trim_size =
       and block_put =
         let f { t; _ } (h, executable, contents) =
           let* () = Logs_async.info (fun m -> m "PUT blocks/%s" h) in
-          let f c = Async.return @@ Core.Out_channel.output_string c contents in
+          let f writer = Async.return @@ Async.Writer.write writer contents in
           Blocks.put ~f t (hash h) executable
         in
         Async_rpc.implement Rpc.block_put f
@@ -276,7 +276,10 @@ let run config host port root trim_period trim_size =
       and index_put =
         let f { t; _ } (path, h, contents) =
           let* () = Logs_async.info (fun m -> m "PUT index/%s" h) in
-          let f c = Async.return @@ Core.Out_channel.output_lines c contents in
+          let f writer =
+            Async.return
+            @@ List.iter ~f:(Async.Writer.write_line writer) contents
+          in
           Blocks.put ~f ~path t (hash h) false
         in
         Async_rpc.implement Rpc.index_put f
@@ -288,8 +291,8 @@ let run config host port root trim_period trim_size =
           | Result.Ok { contents; _ } ->
             let+ () =
               if Config.ranges_include ranges h then
-                let f c =
-                  Async.return @@ Core.Out_channel.output_string c payload
+                let f writer =
+                  Async.return @@ Async.Writer.write writer payload
                 in
                 Blocks.put ~f t h false
               else
@@ -305,12 +308,9 @@ let run config host port root trim_period trim_size =
                     >>= Rpc.decode_block_get
                     >>= function
                     | Some (contents, executable) ->
-                      let f c =
-                        let writer =
-                          Async.Writer.of_out_channel c Unix.Fd.Kind.File
-                          |> Async.Writer.pipe
-                        in
-                        Async.Pipe.transfer ~f:Core.Fn.id contents writer
+                      let f writer =
+                        Async.Pipe.transfer ~f:Core.Fn.id contents
+                          (Async.Writer.pipe writer)
                       in
                       Blocks.put ~f t (hash h) executable
                     | None -> Async.return ()

@@ -301,33 +301,18 @@ let run config host port root trim_period trim_size =
                     let h = Digest.to_string digest in
                     let* () = Logs_async.info (fun m -> m "FETCH %s" h) in
                     Async.Rpc.Pipe_rpc.dispatch Rpc.block_get connection h
+                    >>= Rpc.decode_block_get
                     >>= function
-                    | Result.Ok (Result.Ok (pipe, _)) -> (
-                      Async.Pipe.read pipe >>= function
-                      | `Eof
-                      | `Ok (Core.Either.First _) ->
-                        let* () =
-                          Logs_async.err (fun m ->
-                              m "missing executable metadata in block_put %s" h)
+                    | Some (contents, executable) ->
+                      let f c =
+                        let writer =
+                          Async.Writer.of_out_channel c Unix.Fd.Kind.File
+                          |> Async.Writer.pipe
                         in
-                        Async.return ()
-                      | `Ok (Core.Either.Second executable) ->
-                        let f c =
-                          let writer =
-                            Async.Writer.of_out_channel c Unix.Fd.Kind.File
-                            |> Async.Writer.pipe
-                          in
-                          let f = function
-                            | Core.Either.First s -> s
-                            | Core.Either.Second _ ->
-                              (* Fail more gracefully *)
-                              failwith
-                                "metadata in the middle of put_block data"
-                          in
-                          Async.Pipe.transfer ~f pipe writer
-                        in
-                        Blocks.put ~f t (hash h) executable )
-                    | _ -> Async.return ()
+                        Async.Pipe.transfer ~f:Core.Fn.id contents writer
+                      in
+                      Blocks.put ~f t (hash h) executable
+                    | None -> Async.return ()
                   else
                     Async.Deferred.return ()
                 in

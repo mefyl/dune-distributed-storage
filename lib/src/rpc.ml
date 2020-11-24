@@ -10,6 +10,14 @@ type block =
   ; executable : bool
   }
 
+type hash = string
+
+type contents = string
+
+type name = string
+
+type executable = bool
+
 let block_get =
   let bin_query = [%bin_type_class: string]
   and bin_response = [%bin_type_class: string]

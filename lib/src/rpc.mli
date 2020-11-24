@@ -10,17 +10,25 @@ type block =
   ; executable : bool
   }
 
-val block_get : (string, block_pipe, unit) Pipe_rpc.t
+type hash = string
 
-val block_has : (string, bool) Rpc.t
+type contents = string
 
-val block_put : (string * bool * string, unit) Rpc.t
+type name = string
 
-val index_get : (string * string, string list option) Rpc.t
+type executable = bool
 
-val index_put : (string * string * string list, unit) Rpc.t
+val block_get : (hash, block_pipe, unit) Pipe_rpc.t
 
-val metadata_put : (string * string, unit) Rpc.t
+val block_has : (hash, bool) Rpc.t
+
+val block_put : (hash * executable * contents, unit) Rpc.t
+
+val index_get : (name * hash, string list option) Rpc.t
+
+val index_put : (name * hash * contents list, unit) Rpc.t
+
+val metadata_put : (hash * contents, unit) Rpc.t
 
 (** Transform the response of the block_get pipe RPC into an intelligible stream
     of the file content and executable boolean *)

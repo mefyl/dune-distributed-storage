@@ -225,7 +225,7 @@ let run config host port root trim_period trim_size =
       | Result.Error exn -> raise exn
     in
     let implementations =
-      let hash h =
+      let digest_from_hex_exn h =
         match Digest.from_hex h with
         | None -> failwith "invalid hash"
         | Some h -> h
@@ -238,7 +238,7 @@ let run config host port root trim_period trim_size =
               let* reader = Async.Reader.open_file path in
               Async.return @@ Async.Reader.pipe reader
             in
-            Blocks.get ~f t (hash h)
+            Blocks.get ~f t (digest_from_hex_exn h)
           in
           block >>= function
           | None -> Async.Deferred.Result.fail ()
@@ -252,20 +252,22 @@ let run config host port root trim_period trim_size =
         let f { t; _ } h =
           let* () = Logs_async.info (fun m -> m "HEAD blocks/%s" h) in
 
-          Blocks.head t (hash h)
+          Blocks.head t (digest_from_hex_exn h)
         in
         Async_rpc.implement Rpc.block_has f
       and block_put =
         let f { t; _ } (h, executable, contents) =
           let* () = Logs_async.info (fun m -> m "PUT blocks/%s" h) in
           let f writer = Async.return @@ Async.Writer.write writer contents in
-          Blocks.put ~f t (hash h) executable
+          Blocks.put ~f t (digest_from_hex_exn h) executable
         in
         Async_rpc.implement Rpc.block_put f
       and index_get =
         let f { t; _ } (path, h) =
           let* () = Logs_async.info (fun m -> m "GET index/%s" h) in
-          Blocks.get ~path ~f:Core.In_channel.read_lines t (hash h) >>| function
+          Blocks.get ~path ~f:Core.In_channel.read_lines t
+            (digest_from_hex_exn h)
+          >>| function
           | Some (v, _) -> Some v
           | None -> None
         in
@@ -277,13 +279,13 @@ let run config host port root trim_period trim_size =
             Async.return
             @@ List.iter ~f:(Async.Writer.write_line writer) contents
           in
-          Blocks.put ~f ~path t (hash h) false
+          Blocks.put ~f ~path t (digest_from_hex_exn h) false
         in
         Async_rpc.implement Rpc.index_put f
       and metadata_put =
         let f { t; connection } (h, payload) =
           let* () = Logs_async.info (fun m -> m "PUT metadata/%s" h) in
-          let h = hash h in
+          let h = digest_from_hex_exn h in
           match Cache.Local.Metadata_file.of_string payload with
           | Result.Ok { contents; _ } ->
             let+ () =
@@ -309,7 +311,7 @@ let run config host port root trim_period trim_size =
                         Async.Pipe.transfer ~f:Core.Fn.id contents
                           (Async.Writer.pipe writer)
                       in
-                      Blocks.put ~f t (hash h) executable
+                      Blocks.put ~f t (digest_from_hex_exn h) executable
                     | None -> Async.return ()
                   else
                     Async.Deferred.return ()

@@ -3,11 +3,11 @@ open Core
 
 let ( let* ) = ( >>= )
 
-type block_pipe = (string, bool) Either.t
+type block_pipe = string
 
 let block_get =
   let bin_query = [%bin_type_class: string]
-  and bin_response = [%bin_type_class: (string, bool) Either.t]
+  and bin_response = [%bin_type_class: string]
   and bin_error = [%bin_type_class: unit] in
   Async.Rpc.Pipe_rpc.create ~name:"get_block" ~version:0 ~bin_query
     ~bin_response ~bin_error ()
@@ -40,24 +40,30 @@ let metadata_put =
 let decode_block_get = function
   | Result.Ok (Result.Ok (pipe, _)) -> (
     Async.Pipe.read pipe >>= function
-    | `Eof
-    | `Ok (Core.Either.First _) ->
+    | `Eof ->
       let* () =
         Logs_async.err (fun m -> m "missing executable metadata in block_put")
       in
       Async.return None
-    | `Ok (Core.Either.Second executable) ->
-      let f = function
-        | Core.Either.First s -> s
-        | Core.Either.Second _ ->
-          (* Fail more gracefully *)
-          failwith "metadata in the middle of put_block data"
+    | `Ok s ->
+      let len = String.length s in
+      let flags = s.[0] |> Char.to_int
+      and contents =
+        if String.length s = 1 then
+          [ pipe ]
+        else
+          [ Async.Pipe.of_list [ String.sub ~pos:1 ~len:(len - 1) s ]; pipe ]
       in
-      Async.return @@ Some (Async.Pipe.map ~f pipe, executable) )
+      Async.return
+      @@ Option.return (Async.Pipe.concat contents, flags land 1 <> 0) )
   | _ -> Async.return None
 
 let encode_block_get executable contents =
+  let flag =
+    if executable then
+      1
+    else
+      0
+  in
   Async.Pipe.concat
-    [ Async.Pipe.of_list [ Core.Either.second executable ]
-    ; Async.Pipe.map ~f:Core.Either.first contents
-    ]
+    [ Async.Pipe.of_list [ String.make 1 (Char.of_int_exn flag) ]; contents ]

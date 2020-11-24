@@ -21,12 +21,6 @@ type executable = bool
 (** Get any block from the peer *)
 val block_get : (hash, block_pipe, unit) Pipe_rpc.t
 
-(** Whether a block is present on the peer *)
-val block_has : (hash, bool) Rpc.t
-
-(** Upload a block to the distributed storage *)
-val block_put : (hash * executable * contents, unit) Rpc.t
-
 (** Fetch an index from the given category from the distributed storage *)
 val index_get : (category * hash, string list option) Rpc.t
 

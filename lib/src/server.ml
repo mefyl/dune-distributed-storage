@@ -248,20 +248,6 @@ let run config host port root trim_period trim_size =
             @@ Rpc.encode_block_get { executable; contents }
         in
         Async.Rpc.Pipe_rpc.implement Rpc.block_get f
-      and block_has =
-        let f { t; _ } h =
-          let* () = Logs_async.info (fun m -> m "HEAD blocks/%s" h) in
-
-          Blocks.head t (digest_from_hex_exn h)
-        in
-        Async_rpc.implement Rpc.block_has f
-      and block_put =
-        let f { t; _ } (h, executable, contents) =
-          let* () = Logs_async.info (fun m -> m "PUT blocks/%s" h) in
-          let f writer = Async.return @@ Async.Writer.write writer contents in
-          Blocks.put ~f t (digest_from_hex_exn h) executable
-        in
-        Async_rpc.implement Rpc.block_put f
       and index_get =
         let f { t; _ } (path, h) =
           let* () = Logs_async.info (fun m -> m "GET index/%s" h) in
@@ -326,14 +312,7 @@ let run config host port root trim_period trim_size =
       in
       match
         Async.Rpc.Implementations.create
-          ~implementations:
-            [ block_get
-            ; block_has
-            ; block_put
-            ; index_get
-            ; index_put
-            ; metadata_put
-            ]
+          ~implementations:[ block_get; index_get; index_put; metadata_put ]
           ~on_unknown_rpc:`Raise
       with
       | Result.Ok impls -> impls

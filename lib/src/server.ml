@@ -241,15 +241,13 @@ let run config host port root trim_period trim_size =
             Blocks.get ~f t (hash h)
           in
           block >>= function
-          | None -> Async.return @@ Result.Error ()
+          | None -> Async.Deferred.Result.fail ()
           | Some (contents, executable) ->
-            let+ contents = contents in
-            Result.return
-            @@ Async.Pipe.concat
-                 [ Async.Pipe.of_list [ Core.Either.second executable ]
-                 ; Async.Pipe.map ~f:Core.Either.first contents
-                 ]
+            let* contents = contents in
+            Async.Deferred.Result.return
+            @@ Rpc.encode_block_get executable contents
         in
+
         Async.Rpc.Pipe_rpc.implement Rpc.block_get f
       and block_has =
         let f { t; _ } h =

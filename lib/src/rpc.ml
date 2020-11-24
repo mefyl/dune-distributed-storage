@@ -3,6 +3,8 @@ open Core
 
 let ( let* ) = ( >>= )
 
+type block_pipe = (string, bool) Either.t
+
 let block_get =
   let bin_query = [%bin_type_class: string]
   and bin_response = [%bin_type_class: (string, bool) Either.t]
@@ -53,3 +55,9 @@ let decode_block_get = function
       in
       Async.return @@ Some (Async.Pipe.map ~f pipe, executable) )
   | _ -> Async.return None
+
+let encode_block_get executable contents =
+  Async.Pipe.concat
+    [ Async.Pipe.of_list [ Core.Either.second executable ]
+    ; Async.Pipe.map ~f:Core.Either.first contents
+    ]

@@ -14,20 +14,26 @@ type hash = string
 
 type contents = string
 
-type name = string
+type category = string
 
 type executable = bool
 
+(** Get any block from the peer *)
 val block_get : (hash, block_pipe, unit) Pipe_rpc.t
 
+(** Whether a block is present on the peer *)
 val block_has : (hash, bool) Rpc.t
 
+(** Upload a block to the distributed storage *)
 val block_put : (hash * executable * contents, unit) Rpc.t
 
-val index_get : (name * hash, string list option) Rpc.t
+(** Fetch an index from the given category from the distributed storage *)
+val index_get : (category * hash, string list option) Rpc.t
 
-val index_put : (name * hash * contents list, unit) Rpc.t
+(** Upload an index in the given category to the distributed storage *)
+val index_put : (category * hash * contents list, unit) Rpc.t
 
+(** Upload a metadata file to the distributed storage *)
 val metadata_put : (hash * contents, unit) Rpc.t
 
 (** Transform the response of the block_get pipe RPC into an intelligible stream

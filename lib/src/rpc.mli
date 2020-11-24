@@ -1,7 +1,14 @@
 open Base
 open Async.Rpc
 
+(** Data being piped by block_get pipe RPC. An implementation detail, use
+    [encode_block_get] and [decode_block_get] to make it intelligible. *)
 type block_pipe
+
+type block =
+  { contents : string Async.Pipe.Reader.t
+  ; executable : bool
+  }
 
 val block_get : (string, block_pipe, unit) Pipe_rpc.t
 
@@ -19,9 +26,8 @@ val metadata_put : (string * string, unit) Rpc.t
     of the file content and executable boolean *)
 val decode_block_get :
      ((block_pipe Async.Pipe.Reader.t * _, _) Result.t, _) Result.t
-  -> (string Async.Pipe.Reader.t * bool) option Async_kernel.Deferred.t
+  -> block option Async_kernel.Deferred.t
 
 (** Transform an executable boolean and some file contents into a block_get pipe
     RPC response *)
-val encode_block_get :
-  bool -> string Async.Pipe.Reader.t -> block_pipe Async.Pipe.Reader.t
+val encode_block_get : block -> block_pipe Async.Pipe.Reader.t

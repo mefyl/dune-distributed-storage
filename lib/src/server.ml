@@ -245,9 +245,8 @@ let run config host port root trim_period trim_size =
           | Some (contents, executable) ->
             let* contents = contents in
             Async.Deferred.Result.return
-            @@ Rpc.encode_block_get executable contents
+            @@ Rpc.encode_block_get { executable; contents }
         in
-
         Async.Rpc.Pipe_rpc.implement Rpc.block_get f
       and block_has =
         let f { t; _ } h =
@@ -305,7 +304,7 @@ let run config host port root trim_period trim_size =
                     Async.Rpc.Pipe_rpc.dispatch Rpc.block_get connection h
                     >>= Rpc.decode_block_get
                     >>= function
-                    | Some (contents, executable) ->
+                    | Some { contents; executable } ->
                       let f writer =
                         Async.Pipe.transfer ~f:Core.Fn.id contents
                           (Async.Writer.pipe writer)

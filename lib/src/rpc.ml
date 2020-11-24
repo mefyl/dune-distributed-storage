@@ -5,6 +5,11 @@ let ( let* ) = ( >>= )
 
 type block_pipe = string
 
+type block =
+  { contents : string Async.Pipe.Reader.t
+  ; executable : bool
+  }
+
 let block_get =
   let bin_query = [%bin_type_class: string]
   and bin_response = [%bin_type_class: string]
@@ -55,10 +60,13 @@ let decode_block_get = function
           [ Async.Pipe.of_list [ String.sub ~pos:1 ~len:(len - 1) s ]; pipe ]
       in
       Async.return
-      @@ Option.return (Async.Pipe.concat contents, flags land 1 <> 0) )
+      @@ Option.return
+           { contents = Async.Pipe.concat contents
+           ; executable = flags land 1 <> 0
+           } )
   | _ -> Async.return None
 
-let encode_block_get executable contents =
+let encode_block_get { contents; executable } =
   let flag =
     if executable then
       1

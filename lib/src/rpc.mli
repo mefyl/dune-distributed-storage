@@ -29,13 +29,3 @@ val index_put : (category * hash * contents list, unit) Rpc.t
 
 (** Upload a metadata file to the distributed storage *)
 val metadata_put : (hash * contents, unit) Rpc.t
-
-(** Transform the response of the block_get pipe RPC into an intelligible stream
-    of the file content and executable boolean *)
-val decode_block_get :
-     ((block_pipe Async.Pipe.Reader.t * _, _) Result.t, _) Result.t
-  -> block option Async_kernel.Deferred.t
-
-(** Transform an executable boolean and some file contents into a block_get pipe
-    RPC response *)
-val encode_block_get : block -> block_pipe Async.Pipe.Reader.t

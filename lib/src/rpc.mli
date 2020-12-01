@@ -19,7 +19,7 @@ type category = string
 type executable = bool
 
 (** Get any block from the peer *)
-val block_get : (hash, block_pipe, unit) Pipe_rpc.t
+val block_get : (hash, executable, string, unit) State_rpc.t
 
 (** Fetch an index from the given category from the distributed storage *)
 val index_get : (category * hash, string list option) Rpc.t

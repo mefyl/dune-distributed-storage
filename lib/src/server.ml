@@ -244,10 +244,9 @@ let run config host port root trim_period trim_size =
           | None -> Async.Deferred.Result.fail ()
           | Some (contents, executable) ->
             let* contents = contents in
-            Async.Deferred.Result.return
-            @@ Rpc.encode_block_get { executable; contents }
+            Async.Deferred.Result.return @@ (executable, contents)
         in
-        Async.Rpc.Pipe_rpc.implement Rpc.block_get f
+        Async.Rpc.State_rpc.implement Rpc.block_get f
       and index_get =
         let f { t; _ } (path, h) =
           let* () = Logs_async.info (fun m -> m "GET index/%s" h) in
@@ -289,16 +288,15 @@ let run config host port root trim_period trim_size =
                   if Config.ranges_include ranges digest then
                     let h = Digest.to_string digest in
                     let* () = Logs_async.info (fun m -> m "FETCH %s" h) in
-                    Async.Rpc.Pipe_rpc.dispatch Rpc.block_get connection h
-                    >>= Rpc.decode_block_get
+                    Async.Rpc.State_rpc.dispatch Rpc.block_get connection h
                     >>= function
-                    | Some { contents; executable } ->
+                    | Result.Ok (Result.Ok (executable, contents, _metadata)) ->
                       let f writer =
                         Async.Pipe.transfer ~f:Core.Fn.id contents
                           (Async.Writer.pipe writer)
                       in
                       Blocks.put ~f t (digest_from_hex_exn h) executable
-                    | None -> Async.return ()
+                    | _ -> Logs_async.warn (fun m -> m "fetching %s failed" h)
                   else
                     Async.Deferred.return ()
                 in

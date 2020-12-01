@@ -20,10 +20,11 @@ type executable = bool
 
 let block_get =
   let bin_query = [%bin_type_class: string]
-  and bin_response = [%bin_type_class: string]
+  and bin_state = [%bin_type_class: bool]
+  and bin_update = [%bin_type_class: string]
   and bin_error = [%bin_type_class: unit] in
-  Async.Rpc.Pipe_rpc.create ~name:"get_block" ~version:0 ~bin_query
-    ~bin_response ~bin_error ()
+  Async.Rpc.State_rpc.create ~name:"get_block" ~version:0 ~bin_query ~bin_state
+    ~bin_update ~bin_error ()
 
 let index_get =
   let bin_query = [%bin_type_class: string * string]

@@ -7,6 +7,8 @@ let ( >>| ) = Async.( >>| )
 
 let ( let* ) = ( >>= )
 
+let ( and* ) = Async.Deferred.both
+
 let ( let+ ) = ( >>| )
 
 let ( and+ ) = Async.Deferred.both
@@ -98,7 +100,7 @@ module Blocks = struct
     ; size : int
     }
 
-  let put ?path ~f { root; ranges } hash executable =
+  let put ?path ~f fd_throttle { root; ranges } hash executable =
     let () = check_range ranges hash in
     let* path = file_path ?path root hash in
     let put () =
@@ -108,7 +110,8 @@ module Blocks = struct
         else
           0o600
       in
-      Async.Writer.with_file_atomic ~perm (Path.to_string path) ~f
+      Async.Throttle.enqueue fd_throttle (fun () ->
+          Async.Writer.with_file_atomic ~perm (Path.to_string path) ~f)
     in
     Async.try_with ~extract_exn:true put >>= function
     | Result.Ok v -> Async.return v
@@ -193,6 +196,9 @@ let trim { root; ranges } ~goal =
     Logs_async.debug (fun m -> m "skip trimming")
 
 let run config host port root trim_period trim_size =
+  let fd_throttle =
+    Async.Throttle.create ~continue_on_error:true ~max_concurrent_jobs:500
+  in
   let ranges =
     match config with
     | None -> [ Config.range_total ]
@@ -233,9 +239,30 @@ let run config host port root trim_period trim_size =
       let block_get =
         let f { t; _ } h =
           let* () = Logs_async.info (fun m -> m "GET blocks/%s" h) in
+          (* Throttling file descriptor usage of state RPCs is a bit complex: as
+             we return a pipe that Async.Rpc will consume by itself, the actual
+             closing of the file descriptor will happen out of our scope, when
+             the pipe is exhausted and closes the reader. Here we enqueue a fake
+             job, ensure it locked a slot before continuing and complete it
+             manually when the reader is closed. *)
+          let over = Async.Ivar.create ()
+          and acquired = Async.Ivar.create () in
+          let () =
+            Async.don't_wait_for
+            @@ Async.Throttle.enqueue fd_throttle (fun () ->
+                   Async.Ivar.fill acquired ();
+                   Async.Ivar.read over)
+          in
+          (* Wait for a job slot to be acquired *)
+          let* () = Async.Ivar.read acquired in
           let block =
             let f path =
               let* reader = Async.Reader.open_file path in
+              (* Complete our job and thus free a slot when Async.State_rpc
+                 actually closes the reader. *)
+              Async.don't_wait_for
+              @@ ( Async.Reader.close_finished reader >>| fun () ->
+                   Async.Ivar.fill over () );
               Async.return @@ Async.Reader.pipe reader
             in
             Blocks.get ~f t (digest_from_hex_exn h)
@@ -249,12 +276,15 @@ let run config host port root trim_period trim_size =
         Async.Rpc.State_rpc.implement Rpc.block_get f
       and index_get =
         let f { t; _ } (path, h) =
-          let* () = Logs_async.info (fun m -> m "GET index/%s" h) in
-          Blocks.get ~path ~f:Core.In_channel.read_lines t
-            (digest_from_hex_exn h)
-          >>| function
-          | Some (v, _) -> Some v
-          | None -> None
+          let f () =
+            let* () = Logs_async.info (fun m -> m "GET index/%s" h) in
+            Blocks.get ~path ~f:Core.In_channel.read_lines t
+              (digest_from_hex_exn h)
+            >>| function
+            | Some (v, _) -> Some v
+            | None -> None
+          in
+          Async.Throttle.enqueue fd_throttle f
         in
         Async_rpc.implement Rpc.index_get f
       and index_put =
@@ -264,7 +294,7 @@ let run config host port root trim_period trim_size =
             Async.return
             @@ List.iter ~f:(Async.Writer.write_line writer) contents
           in
-          Blocks.put ~f ~path t (digest_from_hex_exn h) false
+          Blocks.put ~f ~path fd_throttle t (digest_from_hex_exn h) false
         in
         Async_rpc.implement Rpc.index_put f
       and metadata_put =
@@ -278,7 +308,7 @@ let run config host port root trim_period trim_size =
                 let f writer =
                   Async.return @@ Async.Writer.write writer payload
                 in
-                Blocks.put ~f t h false
+                Blocks.put ~f fd_throttle t h false
               else
                 Async.Deferred.return ()
             and+ () =
@@ -295,7 +325,8 @@ let run config host port root trim_period trim_size =
                         Async.Pipe.transfer ~f:Core.Fn.id contents
                           (Async.Writer.pipe writer)
                       in
-                      Blocks.put ~f t (digest_from_hex_exn h) executable
+                      Blocks.put ~f fd_throttle t (digest_from_hex_exn h)
+                        executable
                     | _ -> Logs_async.warn (fun m -> m "fetching %s failed" h)
                   else
                     Async.Deferred.return ()

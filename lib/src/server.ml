@@ -101,7 +101,7 @@ module Blocks = struct
     ; size : int
     }
 
-  let put ?path ~f fd_throttle { root; ranges } hash executable =
+  let put ?path ~f throttle { root; ranges } hash executable =
     let () = check_range ranges hash in
     let* path = file_path ?path root hash in
     let put () =
@@ -111,7 +111,7 @@ module Blocks = struct
         else
           0o600
       in
-      Async.Throttle.enqueue fd_throttle (fun () ->
+      throttle (fun () ->
           Async.Writer.with_file_atomic ~perm (Path.to_string path) ~f)
     in
     Async.try_with ~extract_exn:true put >>= function
@@ -200,6 +200,24 @@ let run config host port root trim_period trim_size =
   let fd_throttle =
     Async.Throttle.create ~continue_on_error:true ~max_concurrent_jobs:500
   in
+  let throttle title f =
+    let f () =
+      let stop = f () in
+      let period = Core.Time.Span.of_min 1. in
+      Async.Clock.every' ~start:(Async.Clock.after period)
+        ~stop:(stop >>| ignore) period (fun () ->
+          Logs_async.debug (fun m -> m "job %S still running" title));
+      stop
+    in
+    let* () =
+      let waiting = Async.Throttle.num_jobs_waiting_to_start fd_throttle in
+      if waiting > 0 then
+        Logs_async.debug (fun m -> m "RPC queue is full (%i waiting)" waiting)
+      else
+        Async.return ()
+    in
+    Async.Throttle.enqueue fd_throttle f
+  in
   let ranges =
     match config with
     | None -> [ Config.range_total ]
@@ -250,12 +268,15 @@ let run config host port root trim_period trim_size =
           and acquired = Async.Ivar.create () in
           let () =
             Async.don't_wait_for
-            @@ Async.Throttle.enqueue fd_throttle (fun () ->
+            @@ throttle
+                 Fmt.(str "GET blocks/%s" h)
+                 (fun () ->
                    Async.Ivar.fill acquired ();
                    Async.Ivar.read over)
           in
           (* Wait for a job slot to be acquired *)
           let* () = Async.Ivar.read acquired in
+          let* () = Logs_async.info (fun m -> m "ACQUIRED blocks/%s" h) in
           let block =
             let f path =
               let* reader = Async.Reader.open_file path in
@@ -269,7 +290,9 @@ let run config host port root trim_period trim_size =
             Blocks.get ~f t (digest_from_hex_exn h)
           in
           block >>= function
-          | None -> Async.Deferred.Result.fail ()
+          | None ->
+            let () = Async.Ivar.fill over () in
+            Async.Deferred.Result.fail ()
           | Some (contents, executable) ->
             let* contents = contents in
             Async.Deferred.Result.return @@ (executable, contents)
@@ -285,7 +308,7 @@ let run config host port root trim_period trim_size =
             | Some (v, _) -> Some v
             | None -> None
           in
-          Async.Throttle.enqueue fd_throttle f
+          throttle Fmt.(str "GET index/%s" h) f
         in
         Async_rpc.implement Rpc.index_get f
       and index_put =
@@ -295,21 +318,25 @@ let run config host port root trim_period trim_size =
             Async.return
             @@ List.iter ~f:(Async.Writer.write_line writer) contents
           in
-          Blocks.put ~f ~path fd_throttle t (digest_from_hex_exn h) false
+          Blocks.put ~f ~path
+            (throttle Fmt.(str "PUT index/%s" h))
+            t (digest_from_hex_exn h) false
         in
         Async_rpc.implement Rpc.index_put f
       and metadata_put =
         let f { t; connection } (h, payload) =
           let* () = Logs_async.info (fun m -> m "PUT metadata/%s" h) in
-          let h = digest_from_hex_exn h in
+          let digest = digest_from_hex_exn h in
           match Cache.Local.Metadata_file.of_string payload with
           | Result.Ok { contents; _ } ->
             let+ () =
-              if Config.ranges_include ranges h then
+              if Config.ranges_include ranges digest then
                 let f writer =
                   Async.return @@ Async.Writer.write writer payload
                 in
-                Blocks.put ~f fd_throttle t h false
+                Blocks.put ~f
+                  (throttle Fmt.(str "PUT metadata/%s" h))
+                  t digest false
               else
                 Async.Deferred.return ()
             and+ () =
@@ -326,8 +353,9 @@ let run config host port root trim_period trim_size =
                         Async.Pipe.transfer ~f:Core.Fn.id contents
                           (Async.Writer.pipe writer)
                       in
-                      Blocks.put ~f fd_throttle t (digest_from_hex_exn h)
-                        executable
+                      Blocks.put ~f
+                        (throttle Fmt.(str "FETCH %s" h))
+                        t (digest_from_hex_exn h) executable
                     | _ -> Logs_async.warn (fun m -> m "fetching %s failed" h)
                   else
                     Async.Deferred.return ()

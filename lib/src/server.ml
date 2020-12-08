@@ -77,7 +77,8 @@ module Blocks = struct
     let f path stats executable =
       let* () =
         let file_size = stats.Core.Unix.Native_file.st_size in
-        Logs_async.info (fun m -> m "> artifact [%i bytes]" file_size)
+        Logs_async.info (fun m ->
+            m "> %s [%i bytes]" (Digest.to_string hash) file_size)
       in
       Async.return @@ (f @@ Path.to_string path, executable)
     in

@@ -276,7 +276,6 @@ let run config host port root trim_period trim_size =
           in
           (* Wait for a job slot to be acquired *)
           let* () = Async.Ivar.read acquired in
-          let* () = Logs_async.info (fun m -> m "ACQUIRED blocks/%s" h) in
           let block =
             let f path =
               let* reader = Async.Reader.open_file path in

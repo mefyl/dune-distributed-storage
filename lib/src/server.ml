@@ -7,7 +7,11 @@ let ( >>| ) = Async.( >>| )
 
 let ( let* ) = ( >>= )
 
+let ( and* ) = Async.Deferred.both
+
 let ( let+ ) = ( >>| )
+
+let ( and+ ) = Async.Deferred.both
 
 module Unix_caml = Unix
 module Unix = Async.Unix
@@ -17,6 +21,11 @@ type t =
   ; ranges : Config.range list
   }
 
+type state =
+  { connection : Async.Rpc.Connection.t
+  ; t : t
+  }
+
 module Blocks = struct
   let check_range ranges address =
     if not (Config.ranges_include ranges address) then
@@ -24,13 +33,13 @@ module Blocks = struct
         [ Pp.textf "not handling address %s" (Digest.to_string address) ]
 
   let handle_error hash path = function
-    | Unix.Unix_error (Unix.EISDIR, _, _) ->
+    | Unix.Unix_error (Unix.Error.EISDIR, _, _) ->
       let* () =
         Logs_async.err (fun m ->
             m "block file is a directory: %S" (Path.to_string path))
       in
       failwith (Fmt.str "unable to read block %S" (Digest.to_string hash))
-    | Unix.Unix_error (Unix.EACCES, _, _) ->
+    | Unix.Unix_error (Unix.Error.EACCES, _, _) ->
       let* () =
         Logs_async.err (fun m ->
             m "permission denied on block: %S" (Path.to_string path))
@@ -51,7 +60,7 @@ module Blocks = struct
               Unix.mkdir ~p:() ~perm:0o700 (Path.to_string path))
           >>| function
           | Result.Ok ()
-          | Result.Error (Unix.Unix_error (Unix.EEXIST, _, _)) ->
+          | Result.Error (Unix.Unix_error (Unix.Error.EEXIST, _, _)) ->
             ()
           | Result.Error exn -> raise exn
         in
@@ -68,7 +77,8 @@ module Blocks = struct
     let f path stats executable =
       let* () =
         let file_size = stats.Core.Unix.Native_file.st_size in
-        Logs_async.info (fun m -> m "> artifact [%i bytes]" file_size)
+        Logs_async.info (fun m ->
+            m "> %s [%i bytes]" (Digest.to_string hash) file_size)
       in
       Async.return @@ (f @@ Path.to_string path, executable)
     in
@@ -81,7 +91,8 @@ module Blocks = struct
     in
     Async.try_with ~extract_exn:true read >>= function
     | Result.Ok v -> Async.return (Some v)
-    | Result.Error (Unix.Unix_error (Unix.ENOENT, _, _)) -> Async.return None
+    | Result.Error (Unix.Unix_error (Unix.Error.ENOENT, _, _)) ->
+      Async.return None
     | Result.Error e -> handle_error hash path e
 
   type disk_buffer =
@@ -90,7 +101,7 @@ module Blocks = struct
     ; size : int
     }
 
-  let put ?path ~f { root; ranges } hash executable data =
+  let put ?path ~f throttle { root; ranges } hash executable =
     let () = check_range ranges hash in
     let* path = file_path ?path root hash in
     let put () =
@@ -99,8 +110,9 @@ module Blocks = struct
           0o700
         else
           0o600
-      and f c = f c data in
-      Async.return @@ Core.Out_channel.with_file ~perm (Path.to_string path) ~f
+      in
+      throttle (fun () ->
+          Async.Writer.with_file_atomic ~perm (Path.to_string path) ~f)
     in
     Async.try_with ~extract_exn:true put >>= function
     | Result.Ok v -> Async.return v
@@ -185,6 +197,27 @@ let trim { root; ranges } ~goal =
     Logs_async.debug (fun m -> m "skip trimming")
 
 let run config host port root trim_period trim_size =
+  let fd_throttle =
+    Async.Throttle.create ~continue_on_error:true ~max_concurrent_jobs:500
+  in
+  let throttle title f =
+    let f () =
+      let stop = f () in
+      let period = Core.Time.Span.of_min 1. in
+      Async.Clock.every' ~start:(Async.Clock.after period)
+        ~stop:(stop >>| ignore) period (fun () ->
+          Logs_async.debug (fun m -> m "job %S still running" title));
+      stop
+    in
+    let* () =
+      let waiting = Async.Throttle.num_jobs_waiting_to_start fd_throttle in
+      if waiting > 0 then
+        Logs_async.debug (fun m -> m "RPC queue is full (%i waiting)" waiting)
+      else
+        Async.return ()
+    in
+    Async.Throttle.enqueue fd_throttle f
+  in
   let ranges =
     match config with
     | None -> [ Config.range_total ]
@@ -212,46 +245,131 @@ let run config host port root trim_period trim_size =
         Unix.mkdir ~p:() ~perm:0o700 (Path.to_string root) )
       >>| function
       | Result.Ok ()
-      | Result.Error (Unix.Unix_error (Unix.EEXIST, _, _)) ->
+      | Result.Error (Unix.Unix_error (Unix.Error.EEXIST, _, _)) ->
         ()
       | Result.Error exn -> raise exn
     in
     let implementations =
-      let hash h =
+      let digest_from_hex_exn h =
         match Digest.from_hex h with
         | None -> failwith "invalid hash"
         | Some h -> h
       in
       let block_get =
-        let f t h = Blocks.get ~f:Core.In_channel.read_all t (hash h) in
-        Async_rpc.implement Rpc.block_get f
-      and block_has =
-        let f t h = Blocks.head t (hash h) in
-        Async_rpc.implement Rpc.block_has f
-      and block_put =
-        let f t (h, executable, contents) =
-          Blocks.put ~f:Core.Out_channel.output_string t (hash h) executable
-            contents
+        let f { t; _ } h =
+          let* () = Logs_async.info (fun m -> m "GET blocks/%s" h) in
+          (* Throttling file descriptor usage of state RPCs is a bit complex: as
+             we return a pipe that Async.Rpc will consume by itself, the actual
+             closing of the file descriptor will happen out of our scope, when
+             the pipe is exhausted and closes the reader. Here we enqueue a fake
+             job, ensure it locked a slot before continuing and complete it
+             manually when the reader is closed. *)
+          let over = Async.Ivar.create ()
+          and acquired = Async.Ivar.create () in
+          let () =
+            Async.don't_wait_for
+            @@ throttle
+                 Fmt.(str "GET blocks/%s" h)
+                 (fun () ->
+                   Async.Ivar.fill acquired ();
+                   Async.Ivar.read over)
+          in
+          (* Wait for a job slot to be acquired *)
+          let* () = Async.Ivar.read acquired in
+          let block =
+            let f path =
+              let* reader = Async.Reader.open_file path in
+              (* Complete our job and thus free a slot when Async.State_rpc
+                 actually closes the reader. *)
+              Async.don't_wait_for
+              @@ ( Async.Reader.close_finished reader >>| fun () ->
+                   Async.Ivar.fill over () );
+              Async.return @@ Async.Reader.pipe reader
+            in
+            Blocks.get ~f t (digest_from_hex_exn h)
+          in
+          block >>= function
+          | None ->
+            let () = Async.Ivar.fill over () in
+            Async.Deferred.Result.fail ()
+          | Some (contents, executable) ->
+            let* contents = contents in
+            Async.Deferred.Result.return @@ (executable, contents)
         in
-        Async_rpc.implement Rpc.block_put f
+        Async.Rpc.State_rpc.implement Rpc.block_get f
       and index_get =
-        let f t (path, h) =
-          Blocks.get ~path ~f:Core.In_channel.read_lines t (hash h) >>| function
-          | Some (v, _) -> Some v
-          | None -> None
+        let f { t; _ } (path, h) =
+          let f () =
+            let* () = Logs_async.info (fun m -> m "GET index/%s" h) in
+            Blocks.get ~path ~f:Core.In_channel.read_lines t
+              (digest_from_hex_exn h)
+            >>| function
+            | Some (v, _) -> Some v
+            | None -> None
+          in
+          throttle Fmt.(str "GET index/%s" h) f
         in
         Async_rpc.implement Rpc.index_get f
       and index_put =
-        let f t (path, h, contents) =
-          Blocks.put ~f:Core.Out_channel.output_lines ~path t (hash h) false
-            contents
+        let f { t; _ } (path, h, contents) =
+          let* () = Logs_async.info (fun m -> m "PUT index/%s" h) in
+          let f writer =
+            Async.return
+            @@ List.iter ~f:(Async.Writer.write_line writer) contents
+          in
+          Blocks.put ~f ~path
+            (throttle Fmt.(str "PUT index/%s" h))
+            t (digest_from_hex_exn h) false
         in
         Async_rpc.implement Rpc.index_put f
+      and metadata_put =
+        let f { t; connection } (h, payload) =
+          let* () = Logs_async.info (fun m -> m "PUT metadata/%s" h) in
+          let digest = digest_from_hex_exn h in
+          match Cache.Local.Metadata_file.of_string payload with
+          | Result.Ok { contents; _ } ->
+            let+ () =
+              if Config.ranges_include ranges digest then
+                let f writer =
+                  Async.return @@ Async.Writer.write writer payload
+                in
+                Blocks.put ~f
+                  (throttle Fmt.(str "PUT metadata/%s" h))
+                  t digest false
+              else
+                Async.Deferred.return ()
+            and+ () =
+              match contents with
+              | Files files ->
+                let f { Cache.File.digest; _ } =
+                  if Config.ranges_include ranges digest then
+                    let h = Digest.to_string digest in
+                    let* () = Logs_async.info (fun m -> m "FETCH %s" h) in
+                    Async.Rpc.State_rpc.dispatch Rpc.block_get connection h
+                    >>= function
+                    | Result.Ok (Result.Ok (executable, contents, _metadata)) ->
+                      let f writer =
+                        Async.Pipe.transfer ~f:Core.Fn.id contents
+                          (Async.Writer.pipe writer)
+                      in
+                      Blocks.put ~f
+                        (throttle Fmt.(str "FETCH %s" h))
+                        t (digest_from_hex_exn h) executable
+                    | _ -> Logs_async.warn (fun m -> m "fetching %s failed" h)
+                  else
+                    Async.Deferred.return ()
+                in
+                Async.Deferred.List.iter ~f files
+              | Value _ -> Async.return ()
+            in
+            ()
+          | Result.Error e -> failwith e
+        in
+        Async_rpc.implement Rpc.metadata_put f
       in
       match
         Async.Rpc.Implementations.create
-          ~implementations:
-            [ block_get; block_has; block_put; index_get; index_put ]
+          ~implementations:[ block_get; index_get; index_put; metadata_put ]
           ~on_unknown_rpc:`Raise
       with
       | Result.Ok impls -> impls
@@ -268,7 +386,7 @@ let run config host port root trim_period trim_size =
            (Async.Tcp.Bind_to_port.On_port port))
         (fun _addr r w ->
           Async.Rpc.Connection.server_with_close r w
-            ~connection_state:(fun _ -> t)
+            ~connection_state:(fun connection -> { connection; t })
             ~on_handshake_error:
               (`Call
                 (fun exn ->
